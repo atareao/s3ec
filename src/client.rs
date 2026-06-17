@@ -174,6 +174,24 @@ pub async fn download(id: &str, output: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn fetch_remote_files() -> anyhow::Result<Vec<Value>> {
+    let mut all_files = Vec::new();
+    let mut offset = 0i64;
+    let limit = 1000;
+    loop {
+        let qs = format!("?limit={}&offset={}", limit, offset);
+        let resp = get(&format!("/api/files{}", qs)).await?;
+        let files: Vec<Value> = resp.json().await?;
+        let count = files.len() as i64;
+        all_files.extend(files);
+        if count < limit {
+            break;
+        }
+        offset += count;
+    }
+    Ok(all_files)
+}
+
 pub async fn list(
     path: Option<&str>,
     search: Option<&str>,
