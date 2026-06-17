@@ -1,11 +1,26 @@
+use chrono::{Utc, DateTime};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
+    pub api_key: String,
     pub token: String,
     pub expires_at: String,
+}
+
+impl Config {
+    pub fn is_token_expired(&self) -> bool {
+        if let Ok(exp) = DateTime::parse_from_rfc3339(&self.expires_at) {
+            let now = Utc::now();
+            let exp_utc = exp.with_timezone(&Utc);
+            // Refresh if less than 5 minutes remaining
+            (exp_utc - now).num_seconds() < 300
+        } else {
+            true
+        }
+    }
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {

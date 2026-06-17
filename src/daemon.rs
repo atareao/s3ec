@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use chrono::Utc;
 use inotify::{EventMask, Inotify, WatchMask};
+use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
@@ -16,6 +17,10 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
 
     tracing::info!("Starting daemon, watching: {}", dir);
     tracing::info!("Debounce: {}ms", debounce_ms);
+
+    if let Err(e) = sync_dir(watch_dir).await {
+        tracing::warn!("Initial sync failed: {}", e);
+    }
 
     let wm = file_map.clone();
     let wdir = dir.clone();
@@ -67,8 +72,23 @@ async fn watcher_loop(dir: &str, debounce_ms: u64, _file_map: FileMap) -> anyhow
                     let path = format!("{}/{}", dir, name);
                     tracing::info!("Change detected: {}", path);
                     sleep(debounce).await;
-                    if let Err(e) = client::upload(&path, Some(dir)).await {
-                        tracing::warn!("Upload failed for {}: {}", path, e);
+                    let max_retries = 10;
+                    let mut retry = 0;
+                    loop {
+                        match client::upload(&path, None).await {
+                            Ok(()) => break,
+                            Err(e) => {
+                                let retryable = e.to_string().contains("File is empty");
+                                if retry >= max_retries || !retryable {
+                                    tracing::warn!("Upload failed for {}: {}", path, e);
+                                    break;
+                                }
+                                let backoff = Duration::from_millis(debounce_ms * (1 << retry));
+                                tracing::info!("File empty, retrying {} in {:?}...", path, backoff);
+                                retry += 1;
+                                sleep(backoff).await;
+                            }
+                        }
                     }
                 }
             }
@@ -85,6 +105,7 @@ async fn watcher_loop(dir: &str, debounce_ms: u64, _file_map: FileMap) -> anyhow
 }
 
 async fn sync_history(dir: &str) -> anyhow::Result<()> {
+    client::ensure_valid_token().await?;
     let cfg = crate::config::load()?;
     let now = Utc::now().to_rfc3339();
     let url = format!("{}/api/events/history?since={}", cfg.server_url, now);
@@ -103,10 +124,17 @@ async fn sync_history(dir: &str) -> anyhow::Result<()> {
 async fn sse_loop(dir: &str) -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
+    client::ensure_valid_token().await?;
     let cfg = crate::config::load()?;
     let client = reqwest::Client::new();
     let url = format!("{}/api/events", cfg.server_url);
     let resp = client.get(&url).bearer_auth(&cfg.token).send().await?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // Token expired, refresh and try again next loop
+        return Err(anyhow::anyhow!("401 Unauthorized"));
+    }
 
     let mut buf = String::new();
     let mut stream = resp.bytes_stream();
@@ -176,4 +204,46 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
         }
         _ => {}
     }
+}
+
+pub async fn sync_dir(dir: &str) -> anyhow::Result<()> {
+    client::ensure_valid_token().await?;
+    let dir_path = Path::new(dir);
+    if !dir_path.exists() {
+        anyhow::bail!("Directory does not exist: {}", dir);
+    }
+    tracing::info!("Initial sync of {}", dir);
+    sync_recursive(dir_path, "").await
+}
+
+async fn sync_recursive(dir: &Path, prefix: &str) -> anyhow::Result<()> {
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            let sub_prefix = if prefix.is_empty() {
+                name_str.to_string()
+            } else {
+                format!("{}/{}", prefix, name_str)
+            };
+            Box::pin(sync_recursive(&path, &sub_prefix)).await?;
+        } else if file_type.is_file() {
+            let remote_path = if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix)
+            };
+            tracing::info!("Initial sync: uploading {}", path.display());
+            if let Err(e) = client::upload(path.to_str().unwrap(), remote_path).await {
+                tracing::warn!("Initial sync: failed to upload {}: {}", path.display(), e);
+            }
+        }
+    }
+    Ok(())
 }

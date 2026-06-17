@@ -43,10 +43,15 @@ pub enum Commands {
         id: String,
     },
     Daemon {
-        #[arg(long)]
+        #[arg(long, short = 'w')]
         watch: String,
-        #[arg(long, default_value = "500")]
+        #[arg(long, alias = "debounce", default_value = "500")]
         debounce_ms: u64,
+    },
+    #[command(name = "sync")]
+    Sync {
+        #[arg(long, short = 'w')]
+        watch: String,
     },
 }
 
@@ -63,6 +68,7 @@ impl Commands {
             Info { id } => crate::client::info(&id).await,
             Rm { id } => crate::client::rm(&id).await,
             Daemon { watch, debounce_ms } => crate::daemon::run(&watch, debounce_ms).await,
+            Sync { watch } => crate::daemon::sync_dir(&watch).await,
         }
     }
 }

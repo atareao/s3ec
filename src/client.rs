@@ -24,11 +24,43 @@ pub async fn login(server_url: &str, api_key: &str) -> anyhow::Result<()> {
     let data: Value = resp.json().await?;
     let cfg = Config {
         server_url: server_url.trim_end_matches('/').to_string(),
+        api_key: api_key.to_string(),
         token: data["token"].as_str().unwrap_or_default().to_string(),
         expires_at: data["expires_at"].as_str().unwrap_or_default().to_string(),
     };
     config::save(&cfg)?;
     println!("Logged in. Token expires at {}", cfg.expires_at);
+    Ok(())
+}
+
+pub async fn refresh_token(cfg: &Config) -> anyhow::Result<()> {
+    let client = Client::new();
+    let resp = client
+        .post(format!("{}/api/auth/login", cfg.server_url))
+        .json(&serde_json::json!({ "api_key": &cfg.api_key }))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await?;
+        anyhow::bail!("Token refresh failed ({}): {}", status, body);
+    }
+
+    let data: Value = resp.json().await?;
+    let mut new_cfg = cfg.clone();
+    new_cfg.token = data["token"].as_str().unwrap_or_default().to_string();
+    new_cfg.expires_at = data["expires_at"].as_str().unwrap_or_default().to_string();
+    config::save(&new_cfg)?;
+    tracing::info!("Token refreshed, expires at {}", new_cfg.expires_at);
+    Ok(())
+}
+
+pub async fn ensure_valid_token() -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    if cfg.is_token_expired() {
+        refresh_token(&cfg).await?;
+    }
     Ok(())
 }
 
@@ -59,8 +91,12 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    let data = fs::read(path).await?;
     let meta = fs::metadata(path).await?;
+    if meta.len() == 0 {
+        anyhow::bail!("File is empty, skipping upload");
+    }
+
+    let data = fs::read(path).await?;
 
     let upload_meta = serde_json::json!({
         "path": remote_path.unwrap_or(""),
@@ -83,6 +119,7 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
 
     let form = reqwest::multipart::Form::new()
         .part("file", part)
+        .text("file_name", file_name.to_string())
         .part("metadata", metadata_part);
 
     let resp = build_client()
