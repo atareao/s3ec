@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 use chrono::Utc;
 use inotify::{EventMask, Inotify, WatchMask};
 use tokio::fs;
@@ -212,11 +213,51 @@ pub async fn sync_dir(dir: &str) -> anyhow::Result<()> {
     if !dir_path.exists() {
         anyhow::bail!("Directory does not exist: {}", dir);
     }
-    tracing::info!("Initial sync of {}", dir);
-    sync_recursive(dir_path, "").await
+    tracing::info!("Bidirectional sync of {}", dir);
+
+    let remote_files = client::fetch_remote_files().await?;
+    let mut remote_map: HashMap<String, &serde_json::Value> = HashMap::new();
+    for f in &remote_files {
+        let name = f["name"].as_str().unwrap_or("");
+        let path = f["path"].as_str().unwrap_or("");
+        let key = if path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", path, name)
+        };
+        remote_map.insert(key, f);
+    }
+
+    let mut local_keys: HashSet<String> = HashSet::new();
+    sync_local(dir_path, dir_path, &remote_map, &mut local_keys).await?;
+
+    for (key, f) in &remote_map {
+        if local_keys.contains(key) {
+            continue;
+        }
+        let dest = format!("{}/{}", dir, key);
+        if let Some(id) = f["id"].as_str() {
+            if !Path::new(&dest).exists() {
+                if let Some(parent) = Path::new(&dest).parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                tracing::info!("Downloading remote file: {}", dest);
+                if let Err(e) = client::download(id, Some(&dest)).await {
+                    tracing::warn!("Failed to download {}: {}", dest, e);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
-async fn sync_recursive(dir: &Path, prefix: &str) -> anyhow::Result<()> {
+async fn sync_local(
+    base: &Path,
+    dir: &Path,
+    remote_map: &HashMap<String, &serde_json::Value>,
+    local_keys: &mut HashSet<String>,
+) -> anyhow::Result<()> {
     let mut entries = fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -227,23 +268,47 @@ async fn sync_recursive(dir: &Path, prefix: &str) -> anyhow::Result<()> {
         }
         let file_type = entry.file_type().await?;
         if file_type.is_dir() {
-            let sub_prefix = if prefix.is_empty() {
-                name_str.to_string()
-            } else {
-                format!("{}/{}", prefix, name_str)
-            };
-            Box::pin(sync_recursive(&path, &sub_prefix)).await?;
+            Box::pin(sync_local(base, &path, remote_map, local_keys)).await?;
         } else if file_type.is_file() {
-            let remote_path = if prefix.is_empty() {
-                None
+            let rel_path = path.strip_prefix(base).unwrap();
+            let key = rel_path.to_string_lossy().to_string();
+            local_keys.insert(key.clone());
+
+            let remote_path = rel_path.parent().and_then(|p| {
+                let s = p.to_string_lossy();
+                if s.is_empty() { None } else { Some(s.to_string()) }
+            });
+
+            if let Some(remote) = remote_map.get(&key) {
+                let local_mtime = fs::metadata(&path).await?.modified().ok();
+                let remote_mtime = (*remote)["mtime"].as_str().unwrap_or("");
+                let local_newer = match (local_mtime, remote_mtime.is_empty()) {
+                    (Some(lm), false) => local_mtime_newer(lm, remote_mtime),
+                    _ => true,
+                };
+                if local_newer {
+                    tracing::info!("Uploading local file: {}", path.display());
+                    if let Err(e) = client::upload(path.to_str().unwrap(), remote_path.as_deref()).await {
+                        tracing::warn!("Failed to upload {}: {}", path.display(), e);
+                    }
+                }
             } else {
-                Some(prefix)
-            };
-            tracing::info!("Initial sync: uploading {}", path.display());
-            if let Err(e) = client::upload(path.to_str().unwrap(), remote_path).await {
-                tracing::warn!("Initial sync: failed to upload {}: {}", path.display(), e);
+                tracing::info!("Uploading new file: {}", path.display());
+                if let Err(e) = client::upload(path.to_str().unwrap(), remote_path.as_deref()).await {
+                    tracing::warn!("Failed to upload {}: {}", path.display(), e);
+                }
             }
         }
     }
     Ok(())
+}
+
+fn local_mtime_newer(local: SystemTime, remote_mtime: &str) -> bool {
+    if let Ok(rm) = chrono::DateTime::parse_from_rfc3339(remote_mtime) {
+        let rm_utc: chrono::DateTime<Utc> = rm.with_timezone(&Utc);
+        let rm_sys: SystemTime = rm_utc.into();
+        local > rm_sys
+    } else {
+        true
+    }
 }
