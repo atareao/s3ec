@@ -27,6 +27,7 @@ pub async fn login(server_url: &str, api_key: &str) -> anyhow::Result<()> {
         api_key: api_key.to_string(),
         token: data["token"].as_str().unwrap_or_default().to_string(),
         expires_at: data["expires_at"].as_str().unwrap_or_default().to_string(),
+        concurrency: 20,
     };
     config::save(&cfg)?;
     println!("Logged in. Token expires at {}", cfg.expires_at);
@@ -96,7 +97,7 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
         anyhow::bail!("File is empty, skipping upload");
     }
 
-    let data = fs::read(path).await?;
+    let file = tokio::fs::File::open(path).await?;
 
     let upload_meta = serde_json::json!({
         "path": remote_path.unwrap_or(""),
@@ -107,7 +108,7 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
         }),
     });
 
-    let part = reqwest::multipart::Part::bytes(data)
+    let part = reqwest::multipart::Part::stream(file)
         .file_name(file_name.to_string())
         .mime_str(
             mime_guess::from_path(file_name)

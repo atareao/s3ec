@@ -1,4 +1,4 @@
-use chrono::{Utc, DateTime};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -8,6 +8,12 @@ pub struct Config {
     pub api_key: String,
     pub token: String,
     pub expires_at: String,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+}
+
+fn default_concurrency() -> usize {
+    20
 }
 
 impl Config {

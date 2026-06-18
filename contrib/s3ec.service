@@ -1,12 +1,13 @@
 [Unit]
 Description=S3 Event Client Daemon
-Documentation=https://github.com/anomalyco/s3ec
+Documentation=https://github.com/atareao/s3ec
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/s3ec daemon -w /path/to/watch/dir
+User=%i
+ExecStart=/usr/local/bin/s3ec daemon -w %h/watch
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
