@@ -1,4 +1,9 @@
 # Changelog
+## [0.2.2] - 2026-06-18
+
+### Other
+
+- V0.3.0
 ## [0.2.1] - 2026-06-18
 
 ### 🐛 Bug Fixes
@@ -9,6 +14,7 @@
 ### 🔧 Miscellaneous Tasks
 
 - Merge development into main
+- Release v0.2.1
 ## [0.2.0] - 2026-06-18
 
 ### ✨ Features
