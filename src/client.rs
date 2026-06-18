@@ -157,18 +157,18 @@ pub async fn download(id: &str, output: Option<&str>) -> anyhow::Result<()> {
     let bytes = resp.bytes().await?;
     fs::write(&file_name, &bytes).await?;
 
-    if let Some(mode) = file_info["mode"].as_i64() {
-        if let Ok(m) = std::fs::metadata(&file_name) {
-            let mut perms = m.permissions();
-            perms.set_mode(mode as u32);
-            let _ = std::fs::set_permissions(&file_name, perms);
-        }
+    if let Some(mode) = file_info["mode"].as_i64()
+        && let Ok(m) = std::fs::metadata(&file_name)
+    {
+        let mut perms = m.permissions();
+        perms.set_mode(mode as u32);
+        let _ = std::fs::set_permissions(&file_name, perms);
     }
-    if let Some(mtime_str) = file_info["mtime"].as_str() {
-        if let Ok(mtime) = chrono::DateTime::parse_from_rfc3339(mtime_str) {
-            let ts = filetime::FileTime::from_unix_time(mtime.timestamp(), 0);
-            let _ = filetime::set_file_times(&file_name, ts, ts);
-        }
+    if let Some(mtime_str) = file_info["mtime"].as_str()
+        && let Ok(mtime) = chrono::DateTime::parse_from_rfc3339(mtime_str)
+    {
+        let ts = filetime::FileTime::from_unix_time(mtime.timestamp(), 0);
+        let _ = filetime::set_file_times(&file_name, ts, ts);
     }
 
     println!("Downloaded: {} ({} bytes)", file_name, bytes.len());
@@ -178,7 +178,7 @@ pub async fn download(id: &str, output: Option<&str>) -> anyhow::Result<()> {
 pub async fn fetch_remote_files() -> anyhow::Result<Vec<Value>> {
     let mut all_files = Vec::new();
     let mut offset = 0i64;
-    let limit = 1000;
+    let limit: i64 = 200;
     loop {
         let qs = format!("?limit={}&offset={}", limit, offset);
         let resp = get(&format!("/api/files{}", qs)).await?;

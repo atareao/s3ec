@@ -5,16 +5,14 @@ use std::time::SystemTime;
 use chrono::Utc;
 use inotify::{EventMask, Inotify, WatchMask};
 use tokio::fs;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 
 use crate::client;
 
-type FileMap = Arc<Mutex<HashMap<String, String>>>;
-
 pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     let dir = watch_dir.to_string();
-    let file_map: FileMap = Arc::new(Mutex::new(HashMap::new()));
+    let root = Path::new(&dir).canonicalize()?;
 
     tracing::info!("Starting daemon, watching: {}", dir);
     tracing::info!("Debounce: {}ms", debounce_ms);
@@ -23,11 +21,11 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
         tracing::warn!("Initial sync failed: {}", e);
     }
 
-    let wm = file_map.clone();
     let wdir = dir.clone();
     let wdeb = debounce_ms;
+    let wroot = root.clone();
     let watcher = tokio::spawn(async move {
-        if let Err(e) = watcher_loop(&wdir, wdeb, wm).await {
+        if let Err(e) = watcher_loop(&wdir, wdeb, &wroot).await {
             tracing::error!("Watcher error: {}", e);
         }
     });
@@ -53,53 +51,122 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn watcher_loop(dir: &str, debounce_ms: u64, _file_map: FileMap) -> anyhow::Result<()> {
-    let mut inotify = Inotify::init()?;
-    inotify
+fn add_watches_recursive(
+    inotify: &mut Inotify,
+    watch_dirs: &mut HashMap<inotify::WatchDescriptor, std::path::PathBuf>,
+    dir: &Path,
+) -> anyhow::Result<()> {
+    let wd = inotify
         .watches()
-        .add(Path::new(dir), WatchMask::CREATE | WatchMask::MODIFY | WatchMask::DELETE)?;
+        .add(dir, WatchMask::CREATE | WatchMask::MODIFY | WatchMask::DELETE)?;
+    watch_dirs.insert(wd, dir.to_path_buf());
 
-    let mut buffer = [0u8; 4096];
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ftype) = entry.file_type()
+                && ftype.is_dir()
+            {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                if let Err(e) = add_watches_recursive(inotify, watch_dirs, &entry.path()) {
+                    tracing::warn!("Failed to watch {}: {}", entry.path().display(), e);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Result<()> {
+    let mut inotify = Inotify::init()?;
+    let mut watch_dirs: HashMap<inotify::WatchDescriptor, std::path::PathBuf> = HashMap::new();
+
+    add_watches_recursive(&mut inotify, &mut watch_dirs, root)?;
+    tracing::info!("Watching {} directories with inotify", watch_dirs.len());
+
+    let mut buffer = [0u8; 65536];
     let debounce = Duration::from_millis(debounce_ms);
 
     loop {
         let events = inotify.read_events_blocking(&mut buffer)?;
         for event in events {
-            if event.mask.contains(EventMask::CREATE) || event.mask.contains(EventMask::MODIFY) {
-                if let Some(name) = event.name.and_then(|n| n.to_str()) {
-                    if name.starts_with('.') {
-                        continue;
+            let ev_dir = match watch_dirs.get(&event.wd) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+
+            let is_create = event.mask.contains(EventMask::CREATE);
+            let is_modify = event.mask.contains(EventMask::MODIFY);
+            let is_delete = event.mask.contains(EventMask::DELETE);
+
+            if (is_create || is_modify)
+                && let Some(name) = event.name.and_then(|n| n.to_str())
+            {
+                if name.starts_with('.') {
+                    continue;
+                }
+                let full_path = ev_dir.join(name);
+                let path_str = full_path.to_string_lossy().to_string();
+
+                if is_create
+                    && let Ok(meta) = tokio::fs::metadata(&full_path).await
+                    && meta.is_dir()
+                {
+                    if let Err(e) =
+                        add_watches_recursive(&mut inotify, &mut watch_dirs, &full_path)
+                    {
+                        tracing::warn!(
+                            "Failed to watch new dir {}: {}",
+                            path_str,
+                            e
+                        );
                     }
-                    let path = format!("{}/{}", dir, name);
-                    tracing::info!("Change detected: {}", path);
-                    sleep(debounce).await;
-                    let max_retries = 10;
-                    let mut retry = 0;
-                    loop {
-                        match client::upload(&path, None).await {
-                            Ok(()) => break,
-                            Err(e) => {
-                                let retryable = e.to_string().contains("File is empty");
-                                if retry >= max_retries || !retryable {
-                                    tracing::warn!("Upload failed for {}: {}", path, e);
-                                    break;
-                                }
-                                let backoff = Duration::from_millis(debounce_ms * (1 << retry));
-                                tracing::info!("File empty, retrying {} in {:?}...", path, backoff);
-                                retry += 1;
-                                sleep(backoff).await;
+                    continue;
+                }
+
+                tracing::info!("Change detected: {}", path_str);
+                sleep(debounce).await;
+                let rel_path = full_path.strip_prefix(root).ok()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| {
+                        let s = p.to_string_lossy().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    });
+                let max_retries = 10;
+                let mut retry = 0;
+                loop {
+                    match client::upload(&path_str, rel_path.as_deref()).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            let retryable = e.to_string().contains("File is empty");
+                            if retry >= max_retries || !retryable {
+                                tracing::warn!("Upload failed for {}: {}", path_str, e);
+                                break;
                             }
+                            let backoff =
+                                Duration::from_millis(debounce_ms * (1 << retry));
+                            tracing::info!(
+                                "File empty, retrying {} in {:?}...",
+                                path_str,
+                                backoff
+                            );
+                            retry += 1;
+                            sleep(backoff).await;
                         }
                     }
                 }
             }
-            if event.mask.contains(EventMask::DELETE) {
-                if let Some(name) = event.name.and_then(|n| n.to_str()) {
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    tracing::info!("Delete detected: {}", name);
+            if is_delete
+                && let Some(name) = event.name.and_then(|n| n.to_str())
+            {
+                if name.starts_with('.') {
+                    continue;
                 }
+                tracing::info!("Delete detected: {}/{}", ev_dir.display(), name);
             }
         }
     }
@@ -149,10 +216,10 @@ async fn sse_loop(dir: &str) -> anyhow::Result<()> {
             buf = buf[pos + 2..].to_string();
 
             for line in event_block.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim()) {
-                        handle_event(&event, dir).await;
-                    }
+                if let Some(data) = line.strip_prefix("data:")
+                    && let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim())
+                {
+                    handle_event(&event, dir).await;
                 }
             }
         }
@@ -310,15 +377,28 @@ async fn sync_local(
             let needs_upload = match remote_map.get(&key) {
                 Some(remote) => {
                     let meta = fs::metadata(&path).await?;
-                    let local_mtime = meta.modified().ok();
                     let local_size = meta.len() as i64;
-                    let remote_mtime = (*remote)["mtime"].as_str().unwrap_or("");
+                    let local_mtime = meta.modified().ok();
                     let remote_size = (*remote)["size"].as_i64().unwrap_or(-1);
-                    match local_mtime {
-                        Some(lm) => {
-                            !(local_size == remote_size && !mtime_newer(lm, remote_mtime))
+                    let remote_mtime = (*remote)["mtime"].as_str();
+
+                    match (local_mtime, remote_mtime) {
+                        (Some(lm), Some(rm)) if !rm.is_empty() && mtime_equalish(lm, rm) => {
+                            false
                         }
-                        None => true,
+                        _ => {
+                            if local_size != remote_size {
+                                true
+                            } else {
+                                match (*remote)["checksum_sha256"].as_str() {
+                                    Some(remote_hash) if !remote_hash.is_empty() => {
+                                        let local_hash = sha256_of_file(&path).await?;
+                                        local_hash != remote_hash
+                                    }
+                                    _ => true,
+                                }
+                            }
+                        }
                     }
                 }
                 None => true,
@@ -332,12 +412,31 @@ async fn sync_local(
     Ok(files_to_upload)
 }
 
-fn mtime_newer(local: SystemTime, remote_mtime: &str) -> bool {
+async fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn mtime_equalish(local: SystemTime, remote_mtime: &str) -> bool {
     if let Ok(rm) = chrono::DateTime::parse_from_rfc3339(remote_mtime) {
-        let rm_utc: chrono::DateTime<Utc> = rm.with_timezone(&Utc);
-        let rm_sys: SystemTime = rm_utc.into();
-        local > rm_sys
+        let rm_sys: SystemTime = rm.with_timezone(&Utc).into();
+        let diff = if local > rm_sys {
+            local.duration_since(rm_sys)
+        } else {
+            rm_sys.duration_since(local)
+        };
+        diff.is_ok_and(|d| d.as_secs() < 2)
     } else {
-        true
+        false
     }
 }
