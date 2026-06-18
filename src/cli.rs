@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use chrono::Utc;
 
 #[derive(Parser)]
 #[command(name = "s3ec", about = "S3 Event Client")]
@@ -68,7 +69,14 @@ impl Commands {
             Info { id } => crate::client::info(&id).await,
             Rm { id } => crate::client::rm(&id).await,
             Daemon { watch, debounce_ms } => crate::daemon::run(&watch, debounce_ms).await,
-            Sync { watch } => crate::daemon::sync_dir(&watch).await,
+            Sync { watch } => {
+                crate::daemon::sync_dir(&watch).await?;
+                if let Ok(mut cfg) = crate::config::load() {
+                    cfg.last_sync_at = Some(Utc::now().to_rfc3339());
+                    let _ = crate::config::save(&cfg);
+                }
+                Ok(())
+            }
         }
     }
 }

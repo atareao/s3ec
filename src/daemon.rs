@@ -2,23 +2,42 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use inotify::{EventMask, Inotify, WatchMask};
 use tokio::fs;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 
 use crate::client;
+use crate::config;
 
 pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     let dir = watch_dir.to_string();
     let root = Path::new(&dir).canonicalize()?;
 
+    let sync_start = Utc::now().to_rfc3339();
+
     tracing::info!("Starting daemon, watching: {}", dir);
     tracing::info!("Debounce: {}ms", debounce_ms);
 
-    if let Err(e) = sync_dir(watch_dir).await {
-        tracing::warn!("Initial sync failed: {}", e);
+    match config::load().ok().and_then(|c| c.last_sync_at) {
+        Some(since) => {
+            tracing::info!("Incremental sync since: {}", since);
+            if let Err(e) = incremental_sync(watch_dir, &since).await {
+                tracing::warn!("Incremental sync failed: {}", e);
+            }
+        }
+        None => {
+            tracing::info!("Full initial sync");
+            if let Err(e) = sync_dir(watch_dir).await {
+                tracing::warn!("Initial sync failed: {}", e);
+            }
+        }
+    }
+
+    if let Ok(mut cfg) = config::load() {
+        cfg.last_sync_at = Some(sync_start.clone());
+        let _ = config::save(&cfg);
     }
 
     let wdir = dir.clone();
@@ -31,8 +50,9 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     });
 
     let sdir = dir.clone();
+    let sse_since = sync_start;
     let sse = tokio::spawn(async move {
-        if let Err(e) = sync_history(&sdir).await {
+        if let Err(e) = sync_history(&sdir, &sse_since).await {
             tracing::warn!("History sync failed: {}", e);
         }
         loop {
@@ -58,7 +78,7 @@ fn add_watches_recursive(
 ) -> anyhow::Result<()> {
     let wd = inotify
         .watches()
-        .add(dir, WatchMask::CREATE | WatchMask::MODIFY | WatchMask::DELETE)?;
+        .add(dir, WatchMask::CREATE | WatchMask::MODIFY | WatchMask::DELETE | WatchMask::MOVED_TO)?;
     watch_dirs.insert(wd, dir.to_path_buf());
 
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -102,8 +122,9 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
             let is_create = event.mask.contains(EventMask::CREATE);
             let is_modify = event.mask.contains(EventMask::MODIFY);
             let is_delete = event.mask.contains(EventMask::DELETE);
+            let is_moved_to = event.mask.contains(EventMask::MOVED_TO);
 
-            if (is_create || is_modify)
+            if (is_create || is_modify || is_moved_to)
                 && let Some(name) = event.name.and_then(|n| n.to_str())
             {
                 if name.starts_with('.') {
@@ -112,7 +133,7 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                 let full_path = ev_dir.join(name);
                 let path_str = full_path.to_string_lossy().to_string();
 
-                if is_create
+                if (is_create || is_moved_to)
                     && let Ok(meta) = tokio::fs::metadata(&full_path).await
                     && meta.is_dir()
                 {
@@ -142,15 +163,21 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                     match client::upload(&path_str, rel_path.as_deref()).await {
                         Ok(()) => break,
                         Err(e) => {
-                            let retryable = e.to_string().contains("File is empty");
-                            if retry >= max_retries || !retryable {
+                            let err_msg = e.to_string();
+                            let empty_file = err_msg.contains("File is empty");
+                            let server_error = err_msg.contains("Upload failed");
+                            if retry >= max_retries {
+                                tracing::warn!("Upload failed for {}: {}", path_str, e);
+                                break;
+                            }
+                            if !empty_file && !server_error {
                                 tracing::warn!("Upload failed for {}: {}", path_str, e);
                                 break;
                             }
                             let backoff =
-                                Duration::from_millis(debounce_ms * (1 << retry));
+                                Duration::from_millis(if empty_file { debounce_ms * (1 << retry) } else { 1000 });
                             tracing::info!(
-                                "File empty, retrying {} in {:?}...",
+                                "Upload failed, retrying {} in {:?}...",
                                 path_str,
                                 backoff
                             );
@@ -172,11 +199,10 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
     }
 }
 
-async fn sync_history(dir: &str) -> anyhow::Result<()> {
+async fn sync_history(dir: &str, since: &str) -> anyhow::Result<()> {
     client::ensure_valid_token().await?;
     let cfg = crate::config::load()?;
-    let now = Utc::now().to_rfc3339();
-    let url = format!("{}/api/events/history?since={}", cfg.server_url, now);
+    let url = format!("{}/api/events/history?since={}", cfg.server_url, since);
     let client = reqwest::Client::new();
     let resp = client.get(&url).bearer_auth(&cfg.token).send().await?;
     if !resp.status().is_success() {
@@ -342,6 +368,8 @@ pub async fn sync_dir(dir: &str) -> anyhow::Result<()> {
         let _ = handle.await;
     }
 
+    tracing::info!("🚀 Sincronización completa");
+
     Ok(())
 }
 
@@ -439,4 +467,55 @@ fn mtime_equalish(local: SystemTime, remote_mtime: &str) -> bool {
     } else {
         false
     }
+}
+
+async fn incremental_sync(dir: &str, since: &str) -> anyhow::Result<()> {
+    let since_dt = DateTime::parse_from_rfc3339(since)?;
+    let since_sys: SystemTime = since_dt.with_timezone(&Utc).into();
+
+    tracing::info!("Uploading local files changed since {}", since);
+    walk_and_upload_changed(Path::new(dir), Path::new(dir), &since_sys).await?;
+
+    tracing::info!("Applying remote changes since {}", since);
+    sync_history(dir, since).await?;
+
+    tracing::info!("Incremental sync complete");
+    Ok(())
+}
+
+async fn walk_and_upload_changed(
+    base: &Path,
+    dir: &Path,
+    since: &SystemTime,
+) -> anyhow::Result<()> {
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            Box::pin(walk_and_upload_changed(base, &path, since)).await?;
+        } else if file_type.is_file() {
+            let meta = fs::metadata(&path).await?;
+            if let Ok(mtime) = meta.modified()
+                && mtime > *since
+            {
+                let rel_path = path.strip_prefix(base).ok().and_then(|p| {
+                    p.parent().and_then(|parent| {
+                        let s = parent.to_string_lossy();
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    })
+                });
+                let path_str = path.to_string_lossy().to_string();
+                tracing::info!("Uploading changed file: {}", path_str);
+                if let Err(e) = client::upload(&path_str, rel_path.as_deref()).await {
+                    tracing::warn!("Failed to upload {}: {}", path_str, e);
+                }
+            }
+        }
+    }
+    Ok(())
 }

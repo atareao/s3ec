@@ -1,9 +1,11 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use chrono::Utc;
 use reqwest::Client;
 use serde_json::Value;
 use tokio::fs;
+use tokio::sync::Semaphore;
 
 use crate::config::{self, Config};
 
@@ -28,6 +30,7 @@ pub async fn login(server_url: &str, api_key: &str) -> anyhow::Result<()> {
         token: data["token"].as_str().unwrap_or_default().to_string(),
         expires_at: data["expires_at"].as_str().unwrap_or_default().to_string(),
         concurrency: 20,
+        last_sync_at: None,
     };
     config::save(&cfg)?;
     println!("Logged in. Token expires at {}", cfg.expires_at);
@@ -97,7 +100,7 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
         anyhow::bail!("File is empty, skipping upload");
     }
 
-    let file = tokio::fs::File::open(path).await?;
+    let file_bytes = fs::read(path).await?;
 
     let upload_meta = serde_json::json!({
         "path": remote_path.unwrap_or(""),
@@ -108,7 +111,7 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
         }),
     });
 
-    let part = reqwest::multipart::Part::stream(file)
+    let part = reqwest::multipart::Part::bytes(file_bytes)
         .file_name(file_name.to_string())
         .mime_str(
             mime_guess::from_path(file_name)
@@ -155,6 +158,10 @@ pub async fn download(id: &str, output: Option<&str>) -> anyhow::Result<()> {
 
     let resp = get(&format!("/api/files/{}/download", id)).await?;
     let bytes = resp.bytes().await?;
+
+    if let Some(parent) = Path::new(&file_name).parent() {
+        fs::create_dir_all(parent).await?;
+    }
     fs::write(&file_name, &bytes).await?;
 
     if let Some(mode) = file_info["mode"].as_i64()
@@ -176,20 +183,107 @@ pub async fn download(id: &str, output: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub async fn fetch_remote_files() -> anyhow::Result<Vec<Value>> {
-    let mut all_files = Vec::new();
-    let mut offset = 0i64;
-    let limit: i64 = 200;
-    loop {
-        let qs = format!("?limit={}&offset={}", limit, offset);
-        let resp = get(&format!("/api/files{}", qs)).await?;
-        let files: Vec<Value> = resp.json().await?;
-        let count = files.len() as i64;
-        all_files.extend(files);
-        if count < limit {
-            break;
-        }
-        offset += count;
+    let cfg = config::load()?;
+    let client = Client::new();
+    let limit: i64 = 1000;
+
+    let first_resp = client
+        .get(format!("{}/api/files?limit={}&offset=0", cfg.server_url, limit))
+        .bearer_auth(&cfg.token)
+        .send()
+        .await?;
+    if !first_resp.status().is_success() {
+        anyhow::bail!("Failed to fetch remote files: {}", first_resp.status());
     }
+
+    let total: i64 = first_resp
+        .headers()
+        .get("x-total-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let first_page: Vec<Value> = first_resp.json().await?;
+    let mut all_files = first_page;
+
+    tracing::debug!(
+        total,
+        limit,
+        page_size = all_files.len(),
+        "fetch_remote_files: first page"
+    );
+
+    let remaining = total.saturating_sub(limit);
+    if remaining <= 0 {
+        return Ok(all_files);
+    }
+
+    let semaphore = Arc::new(Semaphore::new(cfg.concurrency));
+    let num_pages = (total + limit - 1) / limit;
+    let mut handles: Vec<(i64, tokio::task::JoinHandle<anyhow::Result<Vec<Value>>>)> = Vec::new();
+
+    for page in 1..num_pages {
+        let offset = page * limit;
+        let sem = Arc::clone(&semaphore);
+        let cl = client.clone();
+        let server_url = cfg.server_url.clone();
+        let token = cfg.token.clone();
+
+        handles.push((offset, tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let resp = cl
+                .get(format!("{}/api/files?limit={}&offset={}", server_url, limit, offset))
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("Page fetch failed: {}", resp.status());
+            }
+            let files: Vec<Value> = resp.json().await?;
+            Ok(files)
+        })));
+    }
+
+    let mut failed_offsets = Vec::new();
+    for (offset, handle) in handles {
+        match handle.await {
+            Ok(Ok(files)) => {
+                tracing::debug!(offset, count = files.len(), "fetch_remote_files: page fetched");
+                all_files.extend(files);
+            }
+            Ok(Err(e)) => {
+                tracing::error!(offset, "Failed to fetch page: {e}");
+                failed_offsets.push(offset);
+            }
+            Err(e) => {
+                tracing::error!("Task join error at offset {offset}: {e}");
+                failed_offsets.push(offset);
+            }
+        }
+    }
+
+    for offset in &failed_offsets {
+        tracing::info!(offset, "Retrying page fetch");
+        match client
+            .get(format!("{}/api/files?limit={}&offset={}", cfg.server_url, limit, offset))
+            .bearer_auth(&cfg.token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<Vec<Value>>().await {
+                    Ok(files) => {
+                        tracing::debug!(offset, count = files.len(), "fetch_remote_files: retry success");
+                        all_files.extend(files);
+                    }
+                    Err(e) => tracing::error!(offset, "Retry parse error: {e}"),
+                }
+            }
+            Ok(resp) => tracing::error!(offset, "Retry failed: {}", resp.status()),
+            Err(e) => tracing::error!(offset, "Retry error: {e}"),
+        }
+    }
+
     Ok(all_files)
 }
 
