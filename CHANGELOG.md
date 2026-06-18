@@ -4,6 +4,10 @@
 ### Other
 
 - V0.3.0
+
+### 🔧 Miscellaneous Tasks
+
+- Release v0.2.2
 ## [0.2.1] - 2026-06-18
 
 ### 🐛 Bug Fixes
