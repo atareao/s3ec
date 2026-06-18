@@ -351,6 +351,41 @@ pub async fn info(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn delete_by_path(name: &str, remote_path: Option<&str>) -> anyhow::Result<()> {
+    let cfg = config::load()?;
+    let client = build_client();
+
+    let mut query = String::from("limit=100");
+    if let Some(p) = remote_path
+        && !p.is_empty()
+    {
+        query.push_str(&format!("&path={}", urlencoding::encode(p)));
+    }
+    let url = format!("{}/api/files?{}", cfg.server_url, query);
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(&cfg.token)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Ok(());
+    }
+
+    let files: Vec<Value> = resp.json().await?;
+    for file in files {
+        if file["name"].as_str() == Some(name)
+            && let Some(id) = file["id"].as_str()
+        {
+            return rm(id).await;
+        }
+    }
+
+    tracing::warn!("No remote file found for deleted local file: {}", name);
+    Ok(())
+}
+
 pub async fn rm(id: &str) -> anyhow::Result<()> {
     let cfg = config::load()?;
     let resp = build_client()
