@@ -1,4 +1,14 @@
 # Changelog
+## [0.2.1] - 2026-06-18
+
+### 🐛 Bug Fixes
+
+- Recursive inotify watches for subdirectory file detection
+- Recursive inotify watches for subdirectory file detection
+
+### 🔧 Miscellaneous Tasks
+
+- Merge development into main
 ## [0.2.0] - 2026-06-18
 
 ### ✨ Features
@@ -10,6 +20,7 @@
 ### 🔧 Miscellaneous Tasks
 
 - Merge development into main
+- Release v0.2.0
 ## [0.1.4] - 2026-06-17
 
 ### 🐛 Bug Fixes
