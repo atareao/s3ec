@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use chrono::Utc;
 use inotify::{EventMask, Inotify, WatchMask};
 use tokio::fs;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{sleep, Duration};
 
 use crate::client;
@@ -215,6 +215,9 @@ pub async fn sync_dir(dir: &str) -> anyhow::Result<()> {
     }
     tracing::info!("Bidirectional sync of {}", dir);
 
+    let cfg = crate::config::load()?;
+    let semaphore = Arc::new(Semaphore::new(cfg.concurrency));
+
     let remote_files = client::fetch_remote_files().await?;
     let mut remote_map: HashMap<String, &serde_json::Value> = HashMap::new();
     for f in &remote_files {
@@ -229,24 +232,47 @@ pub async fn sync_dir(dir: &str) -> anyhow::Result<()> {
     }
 
     let mut local_keys: HashSet<String> = HashSet::new();
-    sync_local(dir_path, dir_path, &remote_map, &mut local_keys).await?;
+    let files_to_upload = sync_local(dir_path, dir_path, &remote_map, &mut local_keys).await?;
 
+    let mut handles = Vec::new();
+    for (file_path, remote_path) in files_to_upload {
+        let sem = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            if let Err(e) = client::upload(&file_path, remote_path.as_deref()).await {
+                tracing::warn!("Failed to upload {}: {}", file_path, e);
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let mut handles = Vec::new();
     for (key, f) in &remote_map {
         if local_keys.contains(key) {
             continue;
         }
         let dest = format!("{}/{}", dir, key);
         if let Some(id) = f["id"].as_str() {
+            let id = id.to_string();
             if !Path::new(&dest).exists() {
                 if let Some(parent) = Path::new(&dest).parent() {
                     fs::create_dir_all(parent).await?;
                 }
-                tracing::info!("Downloading remote file: {}", dest);
-                if let Err(e) = client::download(id, Some(&dest)).await {
-                    tracing::warn!("Failed to download {}: {}", dest, e);
-                }
+                let sem = semaphore.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    tracing::info!("Downloading remote file: {}", dest);
+                    if let Err(e) = client::download(&id, Some(&dest)).await {
+                        tracing::warn!("Failed to download {}: {}", dest, e);
+                    }
+                }));
             }
         }
+    }
+    for handle in handles {
+        let _ = handle.await;
     }
 
     Ok(())
@@ -257,7 +283,8 @@ async fn sync_local(
     dir: &Path,
     remote_map: &HashMap<String, &serde_json::Value>,
     local_keys: &mut HashSet<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let mut files_to_upload = Vec::new();
     let mut entries = fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -268,7 +295,8 @@ async fn sync_local(
         }
         let file_type = entry.file_type().await?;
         if file_type.is_dir() {
-            Box::pin(sync_local(base, &path, remote_map, local_keys)).await?;
+            let sub = Box::pin(sync_local(base, &path, remote_map, local_keys)).await?;
+            files_to_upload.extend(sub);
         } else if file_type.is_file() {
             let rel_path = path.strip_prefix(base).unwrap();
             let key = rel_path.to_string_lossy().to_string();
@@ -279,31 +307,32 @@ async fn sync_local(
                 if s.is_empty() { None } else { Some(s.to_string()) }
             });
 
-            if let Some(remote) = remote_map.get(&key) {
-                let local_mtime = fs::metadata(&path).await?.modified().ok();
-                let remote_mtime = (*remote)["mtime"].as_str().unwrap_or("");
-                let local_newer = match (local_mtime, remote_mtime.is_empty()) {
-                    (Some(lm), false) => local_mtime_newer(lm, remote_mtime),
-                    _ => true,
-                };
-                if local_newer {
-                    tracing::info!("Uploading local file: {}", path.display());
-                    if let Err(e) = client::upload(path.to_str().unwrap(), remote_path.as_deref()).await {
-                        tracing::warn!("Failed to upload {}: {}", path.display(), e);
+            let needs_upload = match remote_map.get(&key) {
+                Some(remote) => {
+                    let meta = fs::metadata(&path).await?;
+                    let local_mtime = meta.modified().ok();
+                    let local_size = meta.len() as i64;
+                    let remote_mtime = (*remote)["mtime"].as_str().unwrap_or("");
+                    let remote_size = (*remote)["size"].as_i64().unwrap_or(-1);
+                    match local_mtime {
+                        Some(lm) => {
+                            !(local_size == remote_size && !mtime_newer(lm, remote_mtime))
+                        }
+                        None => true,
                     }
                 }
-            } else {
-                tracing::info!("Uploading new file: {}", path.display());
-                if let Err(e) = client::upload(path.to_str().unwrap(), remote_path.as_deref()).await {
-                    tracing::warn!("Failed to upload {}: {}", path.display(), e);
-                }
+                None => true,
+            };
+
+            if needs_upload {
+                files_to_upload.push((path.to_string_lossy().to_string(), remote_path));
             }
         }
     }
-    Ok(())
+    Ok(files_to_upload)
 }
 
-fn local_mtime_newer(local: SystemTime, remote_mtime: &str) -> bool {
+fn mtime_newer(local: SystemTime, remote_mtime: &str) -> bool {
     if let Ok(rm) = chrono::DateTime::parse_from_rfc3339(remote_mtime) {
         let rm_utc: chrono::DateTime<Utc> = rm.with_timezone(&Utc);
         let rm_sys: SystemTime = rm_utc.into();
