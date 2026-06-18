@@ -10,6 +10,8 @@ pub struct Config {
     pub expires_at: String,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
 }
 
 fn default_concurrency() -> usize {
