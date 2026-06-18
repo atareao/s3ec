@@ -193,7 +193,17 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                 if name.starts_with('.') {
                     continue;
                 }
+                let full_path = ev_dir.join(name);
+                let rel_path = full_path.strip_prefix(root).ok()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| {
+                        let s = p.to_string_lossy().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    });
                 tracing::info!("Delete detected: {}/{}", ev_dir.display(), name);
+                if let Err(e) = client::delete_by_path(name, rel_path.as_deref()).await {
+                    tracing::warn!("Failed to notify server about deleted file {}: {}", name, e);
+                }
             }
         }
     }
