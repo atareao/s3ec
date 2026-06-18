@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[expect(dead_code)]
 pub enum AppError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),

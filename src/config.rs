@@ -53,11 +53,13 @@ pub fn save(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[expect(dead_code)]
 pub fn server_url() -> anyhow::Result<String> {
     let cfg = load()?;
     Ok(cfg.server_url.trim_end_matches('/').to_string())
 }
 
+#[expect(dead_code)]
 pub fn token() -> anyhow::Result<String> {
     let cfg = load()?;
     Ok(cfg.token)
