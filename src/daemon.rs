@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use inotify::{EventMask, Inotify, WatchMask};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::fs;
 use tokio::sync::Semaphore;
@@ -11,11 +11,50 @@ use tokio::time::{Duration, sleep};
 use crate::client;
 use crate::config;
 
+fn should_retry_upload(err: &anyhow::Error, retry_count: usize, max_retries: usize) -> bool {
+    let err_msg = err.to_string();
+    if err_msg.contains("File is empty") {
+        return false;
+    }
+    if err_msg.contains("Upload failed") {
+        return retry_count < max_retries;
+    }
+    false
+}
+
+async fn handle_upload(path_str: &str, rel_path: Option<&str>) {
+    const MAX_RETRIES: usize = 10;
+    let mut retry = 0;
+    loop {
+        match client::upload(path_str, rel_path).await {
+            Ok(()) => return,
+            Err(e) => {
+                if !should_retry_upload(&e, retry, MAX_RETRIES) {
+                    if !e.to_string().contains("File is empty") {
+                        tracing::warn!("Upload failed for {}: {}", path_str, e);
+                    }
+                    return;
+                }
+                let backoff = Duration::from_millis(1000);
+                tracing::info!(
+                    "Upload failed, retrying {} in {:?}...",
+                    path_str,
+                    backoff
+                );
+                retry += 1;
+                sleep(backoff).await;
+            }
+        }
+    }
+}
+
 pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     let dir = watch_dir.to_string();
     let root = Path::new(&dir).canonicalize()?;
 
     let sync_start = Utc::now().to_rfc3339();
+
+    let downloading: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     tracing::info!("Starting daemon, watching: {}", dir);
     tracing::info!("Debounce: {}ms", debounce_ms);
@@ -23,7 +62,7 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     match config::load().ok().and_then(|c| c.last_sync_at) {
         Some(since) => {
             tracing::info!("Incremental sync since: {}", since);
-            if let Err(e) = incremental_sync(watch_dir, &since).await {
+            if let Err(e) = incremental_sync(watch_dir, &since, &downloading).await {
                 tracing::warn!("Incremental sync failed: {}", e);
             }
         }
@@ -43,20 +82,22 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     let wdir = dir.clone();
     let wdeb = debounce_ms;
     let wroot = root.clone();
+    let wdownloading = downloading.clone();
     let watcher = tokio::spawn(async move {
-        if let Err(e) = watcher_loop(&wdir, wdeb, &wroot).await {
+        if let Err(e) = watcher_loop(&wdir, wdeb, &wroot, wdownloading).await {
             tracing::error!("Watcher error: {}", e);
         }
     });
 
     let sdir = dir.clone();
     let sse_since = sync_start;
+    let sdownloading = downloading.clone();
     let sse = tokio::spawn(async move {
-        if let Err(e) = sync_history(&sdir, &sse_since).await {
+        if let Err(e) = sync_history(&sdir, &sse_since, sdownloading.clone()).await {
             tracing::warn!("History sync failed: {}", e);
         }
         loop {
-            if let Err(e) = sse_loop(&sdir).await {
+            if let Err(e) = sse_loop(&sdir, sdownloading.clone()).await {
                 tracing::warn!("SSE error: {}, reconnecting in 5s", e);
                 sleep(Duration::from_secs(5)).await;
             }
@@ -102,7 +143,7 @@ fn add_watches_recursive(
     Ok(())
 }
 
-async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Result<()> {
+async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path, downloading: Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     let mut inotify = Inotify::init()?;
     let mut watch_dirs: HashMap<inotify::WatchDescriptor, std::path::PathBuf> = HashMap::new();
 
@@ -146,6 +187,11 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                 }
 
                 tracing::info!("Change detected: {}", path_str);
+
+                if downloading.lock().unwrap().contains(&path_str) {
+                    continue;
+                }
+
                 sleep(debounce).await;
                 let rel_path = full_path
                     .strip_prefix(root)
@@ -155,38 +201,7 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                         let s = p.to_string_lossy().to_string();
                         if s.is_empty() { None } else { Some(s) }
                     });
-                let max_retries = 10;
-                let mut retry = 0;
-                loop {
-                    match client::upload(&path_str, rel_path.as_deref()).await {
-                        Ok(()) => break,
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            let empty_file = err_msg.contains("File is empty");
-                            let server_error = err_msg.contains("Upload failed");
-                            if retry >= max_retries {
-                                tracing::warn!("Upload failed for {}: {}", path_str, e);
-                                break;
-                            }
-                            if !empty_file && !server_error {
-                                tracing::warn!("Upload failed for {}: {}", path_str, e);
-                                break;
-                            }
-                            let backoff = Duration::from_millis(if empty_file {
-                                debounce_ms * (1 << retry)
-                            } else {
-                                1000
-                            });
-                            tracing::info!(
-                                "Upload failed, retrying {} in {:?}...",
-                                path_str,
-                                backoff
-                            );
-                            retry += 1;
-                            sleep(backoff).await;
-                        }
-                    }
-                }
+                handle_upload(&path_str, rel_path.as_deref()).await;
             }
             if is_delete && let Some(name) = event.name.and_then(|n| n.to_str()) {
                 if name.starts_with('.') {
@@ -202,6 +217,12 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                         if s.is_empty() { None } else { Some(s) }
                     });
                 tracing::info!("Delete detected: {}/{}", ev_dir.display(), name);
+
+                let del_path_str = full_path.to_string_lossy().to_string();
+                if downloading.lock().unwrap().contains(&del_path_str) {
+                    continue;
+                }
+
                 if let Err(e) = client::delete_by_path(name, rel_path.as_deref()).await {
                     tracing::warn!("Failed to notify server about deleted file {}: {}", name, e);
                 }
@@ -210,7 +231,7 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
     }
 }
 
-async fn sync_history(dir: &str, since: &str) -> anyhow::Result<()> {
+async fn sync_history(dir: &str, since: &str, downloading: Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     client::ensure_valid_token().await?;
     let cfg = crate::config::load()?;
     let url = format!("{}/api/events/history?since={}", cfg.server_url, since);
@@ -221,12 +242,12 @@ async fn sync_history(dir: &str, since: &str) -> anyhow::Result<()> {
     }
     let events: Vec<serde_json::Value> = resp.json().await?;
     for ev in &events {
-        handle_event(ev, dir).await;
+        handle_event(ev, dir, &downloading).await;
     }
     Ok(())
 }
 
-async fn sse_loop(dir: &str) -> anyhow::Result<()> {
+async fn sse_loop(dir: &str, downloading: Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
     client::ensure_valid_token().await?;
@@ -256,7 +277,7 @@ async fn sse_loop(dir: &str) -> anyhow::Result<()> {
                 if let Some(data) = line.strip_prefix("data:")
                     && let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim())
                 {
-                    handle_event(&event, dir).await;
+                    handle_event(&event, dir, &downloading).await;
                 }
             }
         }
@@ -265,7 +286,7 @@ async fn sse_loop(dir: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_event(event: &serde_json::Value, dir: &str) {
+async fn handle_event(event: &serde_json::Value, dir: &str, downloading: &Arc<Mutex<HashSet<String>>>) {
     let event_type = event["type"].as_str().unwrap_or("");
     let payload = &event["payload"];
 
@@ -281,10 +302,12 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
 
             if let Some(id) = event["resource_id"].as_str() {
                 if !Path::new(&dest).exists() {
+                    downloading.lock().unwrap().insert(dest.clone());
                     tracing::info!("Remote {}: downloading {} as {}", event_type, id, dest);
                     if let Err(e) = client::download(id, Some(&dest)).await {
                         tracing::warn!("Download failed: {}", e);
                     }
+                    downloading.lock().unwrap().remove(&dest);
                 } else if event_type == "file_updated" {
                     match resolve_conflict(id, &dest).await {
                         Ok(ConflictAction::Touch) => {
@@ -303,6 +326,7 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                             }
                         }
                         Ok(ConflictAction::Overwrite) => {
+                            downloading.lock().unwrap().insert(dest.clone());
                             tracing::info!(
                                 "Remote {}: remote is newer, overwriting {}",
                                 event_type,
@@ -311,8 +335,10 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                             if let Err(e) = client::download(id, Some(&dest)).await {
                                 tracing::warn!("Download failed: {}", e);
                             }
+                            downloading.lock().unwrap().remove(&dest);
                         }
                         Ok(ConflictAction::Conflict(conflict_path)) => {
+                            downloading.lock().unwrap().insert(conflict_path.clone());
                             tracing::info!(
                                 "Remote {}: local is newer, saving conflict as {}",
                                 event_type,
@@ -321,6 +347,7 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                             if let Err(e) = client::download(id, Some(&conflict_path)).await {
                                 tracing::warn!("Download failed: {}", e);
                             }
+                            downloading.lock().unwrap().remove(&conflict_path);
                         }
                         Ok(ConflictAction::Skip) | Err(_) => {
                             tracing::info!(
@@ -348,8 +375,10 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                 format!("{}/{}/{}", dir, path, file_name)
             };
             if Path::new(&dest).exists() {
+                downloading.lock().unwrap().insert(dest.clone());
                 tracing::info!("Remote delete: {}", dest);
                 let _ = tokio::fs::remove_file(&dest).await;
+                downloading.lock().unwrap().remove(&dest);
             }
         }
         _ => {}
@@ -564,7 +593,7 @@ async fn resolve_conflict(id: &str, dest: &str) -> anyhow::Result<ConflictAction
     }
 }
 
-async fn incremental_sync(dir: &str, since: &str) -> anyhow::Result<()> {
+async fn incremental_sync(dir: &str, since: &str, downloading: &Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     let since_dt = DateTime::parse_from_rfc3339(since)?;
     let since_sys: SystemTime = since_dt.with_timezone(&Utc).into();
 
@@ -572,7 +601,7 @@ async fn incremental_sync(dir: &str, since: &str) -> anyhow::Result<()> {
     walk_and_upload_changed(Path::new(dir), Path::new(dir), &since_sys).await?;
 
     tracing::info!("Applying remote changes since {}", since);
-    sync_history(dir, since).await?;
+    sync_history(dir, since, downloading.clone()).await?;
 
     tracing::info!("Incremental sync complete");
     Ok(())
@@ -617,4 +646,171 @@ async fn walk_and_upload_changed(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, Duration};
+
+    #[test]
+    fn mtime_equalish_exact_match() {
+        let now = SystemTime::now();
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = now.into();
+            dt.to_rfc3339()
+        };
+        assert!(mtime_equalish(now, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_within_one_second() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_secs(1);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(mtime_equalish(local, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_over_two_seconds() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_secs(3);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(!mtime_equalish(local, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_invalid_remote_string() {
+        assert!(!mtime_equalish(SystemTime::now(), "not-a-date"));
+    }
+
+    #[test]
+    fn mtime_equalish_empty_string() {
+        assert!(!mtime_equalish(SystemTime::now(), ""));
+    }
+
+    #[test]
+    fn mtime_equalish_exactly_two_seconds() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_secs(2);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(!mtime_equalish(local, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_sub_second_diff() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_millis(500);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(mtime_equalish(local, &rfc));
+    }
+
+    #[tokio::test]
+    async fn sha256_of_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let hash = sha256_of_file(&path).await.unwrap();
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_of_known_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"hello world\n").await.unwrap();
+
+        let hash = sha256_of_file(&path).await.unwrap();
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_of_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let content = vec![0xABu8; 100_000];
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        let hash = sha256_of_file(&path).await.unwrap();
+        let expected = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&vec![0xABu8; 100_000]);
+            hex::encode(hasher.finalize())
+        };
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn should_not_retry_empty_file() {
+        let err = anyhow::anyhow!("File is empty");
+        assert!(!should_retry_upload(&err, 0, 10));
+    }
+
+    #[test]
+    fn should_retry_server_error() {
+        let err = anyhow::anyhow!("Upload failed: 500");
+        assert!(should_retry_upload(&err, 0, 10));
+    }
+
+    #[test]
+    fn should_retry_server_error_up_to_max() {
+        let err = anyhow::anyhow!("Upload failed: 503");
+        assert!(should_retry_upload(&err, 0, 10));
+        assert!(should_retry_upload(&err, 5, 10));
+        assert!(should_retry_upload(&err, 9, 10));
+    }
+
+    #[test]
+    fn should_not_retry_server_error_beyond_max() {
+        let err = anyhow::anyhow!("Upload failed: 502");
+        assert!(!should_retry_upload(&err, 10, 10));
+        assert!(!should_retry_upload(&err, 15, 10));
+    }
+
+    #[test]
+    fn should_not_retry_other_errors() {
+        let err = anyhow::anyhow!("Network timeout");
+        assert!(!should_retry_upload(&err, 0, 10));
+    }
+
+    #[test]
+    fn should_not_retry_empty_file_even_if_max_not_reached() {
+        let err = anyhow::anyhow!("File is empty: some_file.txt");
+        assert!(!should_retry_upload(&err, 0, 10));
+        assert!(!should_retry_upload(&err, 0, 1));
+    }
+
+    #[test]
+    fn should_not_retry_empty_file_after_previous_retries() {
+        let err = anyhow::anyhow!("File is empty");
+        assert!(!should_retry_upload(&err, 5, 10));
+    }
+
+    #[test]
+    fn should_respect_custom_max_retries() {
+        let err = anyhow::anyhow!("Upload failed: 500");
+        assert!(should_retry_upload(&err, 2, 3));
+        assert!(!should_retry_upload(&err, 3, 3));
+        assert!(!should_retry_upload(&err, 5, 3));
+    }
 }
