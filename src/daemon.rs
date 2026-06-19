@@ -641,3 +641,116 @@ async fn walk_and_upload_changed(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, Duration};
+
+    #[test]
+    fn mtime_equalish_exact_match() {
+        let now = SystemTime::now();
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = now.into();
+            dt.to_rfc3339()
+        };
+        assert!(mtime_equalish(now, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_within_one_second() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_secs(1);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(mtime_equalish(local, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_over_two_seconds() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_secs(3);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(!mtime_equalish(local, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_invalid_remote_string() {
+        assert!(!mtime_equalish(SystemTime::now(), "not-a-date"));
+    }
+
+    #[test]
+    fn mtime_equalish_empty_string() {
+        assert!(!mtime_equalish(SystemTime::now(), ""));
+    }
+
+    #[test]
+    fn mtime_equalish_exactly_two_seconds() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_secs(2);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(!mtime_equalish(local, &rfc));
+    }
+
+    #[test]
+    fn mtime_equalish_sub_second_diff() {
+        let local = SystemTime::now();
+        let remote = local + Duration::from_millis(500);
+        let rfc = {
+            let dt: chrono::DateTime<Utc> = remote.into();
+            dt.to_rfc3339()
+        };
+        assert!(mtime_equalish(local, &rfc));
+    }
+
+    #[tokio::test]
+    async fn sha256_of_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let hash = sha256_of_file(&path).await.unwrap();
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_of_known_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"hello world\n").await.unwrap();
+
+        let hash = sha256_of_file(&path).await.unwrap();
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+    }
+
+    #[tokio::test]
+    async fn sha256_of_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let content = vec![0xABu8; 100_000];
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        let hash = sha256_of_file(&path).await.unwrap();
+        let expected = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&vec![0xABu8; 100_000]);
+            hex::encode(hasher.finalize())
+        };
+        assert_eq!(hash, expected);
+    }
+}
