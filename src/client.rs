@@ -1,9 +1,9 @@
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::sync::Arc;
 use chrono::Utc;
 use reqwest::Client;
 use serde_json::Value;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::Semaphore;
 
@@ -12,7 +12,10 @@ use crate::config::{self, Config};
 pub async fn login(server_url: &str, api_key: &str) -> anyhow::Result<()> {
     let client = Client::new();
     let resp = client
-        .post(format!("{}/api/auth/login", server_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/api/auth/login",
+            server_url.trim_end_matches('/')
+        ))
         .json(&serde_json::json!({ "api_key": api_key }))
         .send()
         .await?;
@@ -149,6 +152,11 @@ pub async fn upload(file_path: &str, remote_path: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+pub async fn get_file_info(id: &str) -> anyhow::Result<Value> {
+    let resp = get(&format!("/api/files/{}", id)).await?;
+    Ok(resp.json().await?)
+}
+
 pub async fn download(id: &str, output: Option<&str>) -> anyhow::Result<()> {
     let resp = get(&format!("/api/files/{}", id)).await?;
     let file_info: Value = resp.json().await?;
@@ -188,7 +196,10 @@ pub async fn fetch_remote_files() -> anyhow::Result<Vec<Value>> {
     let limit: i64 = 1000;
 
     let first_resp = client
-        .get(format!("{}/api/files?limit={}&offset=0", cfg.server_url, limit))
+        .get(format!(
+            "{}/api/files?limit={}&offset=0",
+            cfg.server_url, limit
+        ))
         .bearer_auth(&cfg.token)
         .send()
         .await?;
@@ -229,26 +240,36 @@ pub async fn fetch_remote_files() -> anyhow::Result<Vec<Value>> {
         let server_url = cfg.server_url.clone();
         let token = cfg.token.clone();
 
-        handles.push((offset, tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let resp = cl
-                .get(format!("{}/api/files?limit={}&offset={}", server_url, limit, offset))
-                .bearer_auth(&token)
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                anyhow::bail!("Page fetch failed: {}", resp.status());
-            }
-            let files: Vec<Value> = resp.json().await?;
-            Ok(files)
-        })));
+        handles.push((
+            offset,
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let resp = cl
+                    .get(format!(
+                        "{}/api/files?limit={}&offset={}",
+                        server_url, limit, offset
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("Page fetch failed: {}", resp.status());
+                }
+                let files: Vec<Value> = resp.json().await?;
+                Ok(files)
+            }),
+        ));
     }
 
     let mut failed_offsets = Vec::new();
     for (offset, handle) in handles {
         match handle.await {
             Ok(Ok(files)) => {
-                tracing::debug!(offset, count = files.len(), "fetch_remote_files: page fetched");
+                tracing::debug!(
+                    offset,
+                    count = files.len(),
+                    "fetch_remote_files: page fetched"
+                );
                 all_files.extend(files);
             }
             Ok(Err(e)) => {
@@ -265,20 +286,25 @@ pub async fn fetch_remote_files() -> anyhow::Result<Vec<Value>> {
     for offset in &failed_offsets {
         tracing::info!(offset, "Retrying page fetch");
         match client
-            .get(format!("{}/api/files?limit={}&offset={}", cfg.server_url, limit, offset))
+            .get(format!(
+                "{}/api/files?limit={}&offset={}",
+                cfg.server_url, limit, offset
+            ))
             .bearer_auth(&cfg.token)
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<Vec<Value>>().await {
-                    Ok(files) => {
-                        tracing::debug!(offset, count = files.len(), "fetch_remote_files: retry success");
-                        all_files.extend(files);
-                    }
-                    Err(e) => tracing::error!(offset, "Retry parse error: {e}"),
+            Ok(resp) if resp.status().is_success() => match resp.json::<Vec<Value>>().await {
+                Ok(files) => {
+                    tracing::debug!(
+                        offset,
+                        count = files.len(),
+                        "fetch_remote_files: retry success"
+                    );
+                    all_files.extend(files);
                 }
-            }
+                Err(e) => tracing::error!(offset, "Retry parse error: {e}"),
+            },
             Ok(resp) => tracing::error!(offset, "Retry failed: {}", resp.status()),
             Err(e) => tracing::error!(offset, "Retry error: {e}"),
         }
@@ -363,11 +389,7 @@ pub async fn delete_by_path(name: &str, remote_path: Option<&str>) -> anyhow::Re
     }
     let url = format!("{}/api/files?{}", cfg.server_url, query);
 
-    let resp = client
-        .get(&url)
-        .bearer_auth(&cfg.token)
-        .send()
-        .await?;
+    let resp = client.get(&url).bearer_auth(&cfg.token).send().await?;
 
     if !resp.status().is_success() {
         return Ok(());
