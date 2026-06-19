@@ -1,12 +1,12 @@
+use chrono::{DateTime, Utc};
+use inotify::{EventMask, Inotify, WatchMask};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
-use chrono::{DateTime, Utc};
-use inotify::{EventMask, Inotify, WatchMask};
 use tokio::fs;
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::client;
 use crate::config;
@@ -76,9 +76,10 @@ fn add_watches_recursive(
     watch_dirs: &mut HashMap<inotify::WatchDescriptor, std::path::PathBuf>,
     dir: &Path,
 ) -> anyhow::Result<()> {
-    let wd = inotify
-        .watches()
-        .add(dir, WatchMask::CREATE | WatchMask::MODIFY | WatchMask::DELETE | WatchMask::MOVED_TO)?;
+    let wd = inotify.watches().add(
+        dir,
+        WatchMask::CREATE | WatchMask::MODIFY | WatchMask::DELETE | WatchMask::MOVED_TO,
+    )?;
     watch_dirs.insert(wd, dir.to_path_buf());
 
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -137,21 +138,18 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                     && let Ok(meta) = tokio::fs::metadata(&full_path).await
                     && meta.is_dir()
                 {
-                    if let Err(e) =
-                        add_watches_recursive(&mut inotify, &mut watch_dirs, &full_path)
+                    if let Err(e) = add_watches_recursive(&mut inotify, &mut watch_dirs, &full_path)
                     {
-                        tracing::warn!(
-                            "Failed to watch new dir {}: {}",
-                            path_str,
-                            e
-                        );
+                        tracing::warn!("Failed to watch new dir {}: {}", path_str, e);
                     }
                     continue;
                 }
 
                 tracing::info!("Change detected: {}", path_str);
                 sleep(debounce).await;
-                let rel_path = full_path.strip_prefix(root).ok()
+                let rel_path = full_path
+                    .strip_prefix(root)
+                    .ok()
                     .and_then(|p| p.parent())
                     .and_then(|p| {
                         let s = p.to_string_lossy().to_string();
@@ -174,8 +172,11 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                                 tracing::warn!("Upload failed for {}: {}", path_str, e);
                                 break;
                             }
-                            let backoff =
-                                Duration::from_millis(if empty_file { debounce_ms * (1 << retry) } else { 1000 });
+                            let backoff = Duration::from_millis(if empty_file {
+                                debounce_ms * (1 << retry)
+                            } else {
+                                1000
+                            });
                             tracing::info!(
                                 "Upload failed, retrying {} in {:?}...",
                                 path_str,
@@ -187,14 +188,14 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                     }
                 }
             }
-            if is_delete
-                && let Some(name) = event.name.and_then(|n| n.to_str())
-            {
+            if is_delete && let Some(name) = event.name.and_then(|n| n.to_str()) {
                 if name.starts_with('.') {
                     continue;
                 }
                 let full_path = ev_dir.join(name);
-                let rel_path = full_path.strip_prefix(root).ok()
+                let rel_path = full_path
+                    .strip_prefix(root)
+                    .ok()
                     .and_then(|p| p.parent())
                     .and_then(|p| {
                         let s = p.to_string_lossy().to_string();
@@ -283,6 +284,51 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                     tracing::info!("Remote {}: downloading {} as {}", event_type, id, dest);
                     if let Err(e) = client::download(id, Some(&dest)).await {
                         tracing::warn!("Download failed: {}", e);
+                    }
+                } else if event_type == "file_updated" {
+                    match resolve_conflict(id, &dest).await {
+                        Ok(ConflictAction::Touch) => {
+                            tracing::info!(
+                                "Remote {}: content identical, syncing mtime for {}",
+                                event_type,
+                                dest
+                            );
+                            let file_info = client::get_file_info(id).await;
+                            if let Ok(info) = file_info
+                                && let Some(mtime_str) = info["mtime"].as_str()
+                                && let Ok(mtime) = chrono::DateTime::parse_from_rfc3339(mtime_str)
+                            {
+                                let ts = filetime::FileTime::from_unix_time(mtime.timestamp(), 0);
+                                let _ = filetime::set_file_times(&dest, ts, ts);
+                            }
+                        }
+                        Ok(ConflictAction::Overwrite) => {
+                            tracing::info!(
+                                "Remote {}: remote is newer, overwriting {}",
+                                event_type,
+                                dest
+                            );
+                            if let Err(e) = client::download(id, Some(&dest)).await {
+                                tracing::warn!("Download failed: {}", e);
+                            }
+                        }
+                        Ok(ConflictAction::Conflict(conflict_path)) => {
+                            tracing::info!(
+                                "Remote {}: local is newer, saving conflict as {}",
+                                event_type,
+                                conflict_path
+                            );
+                            if let Err(e) = client::download(id, Some(&conflict_path)).await {
+                                tracing::warn!("Download failed: {}", e);
+                            }
+                        }
+                        Ok(ConflictAction::Skip) | Err(_) => {
+                            tracing::info!(
+                                "Remote {}: {} already exists locally, skipping",
+                                event_type,
+                                file_name
+                            );
+                        }
                     }
                 } else {
                     tracing::info!(
@@ -409,7 +455,11 @@ async fn sync_local(
 
             let remote_path = rel_path.parent().and_then(|p| {
                 let s = p.to_string_lossy();
-                if s.is_empty() { None } else { Some(s.to_string()) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
             });
 
             let needs_upload = match remote_map.get(&key) {
@@ -421,9 +471,7 @@ async fn sync_local(
                     let remote_mtime = (*remote)["mtime"].as_str();
 
                     match (local_mtime, remote_mtime) {
-                        (Some(lm), Some(rm)) if !rm.is_empty() && mtime_equalish(lm, rm) => {
-                            false
-                        }
+                        (Some(lm), Some(rm)) if !rm.is_empty() && mtime_equalish(lm, rm) => false,
                         _ => {
                             if local_size != remote_size {
                                 true
@@ -479,6 +527,43 @@ fn mtime_equalish(local: SystemTime, remote_mtime: &str) -> bool {
     }
 }
 
+enum ConflictAction {
+    Touch,
+    Overwrite,
+    Conflict(String),
+    Skip,
+}
+
+async fn resolve_conflict(id: &str, dest: &str) -> anyhow::Result<ConflictAction> {
+    let file_info = client::get_file_info(id).await?;
+    let remote_mtime = file_info["mtime"].as_str().unwrap_or("");
+    let remote_hash = file_info["checksum_sha256"].as_str().unwrap_or("");
+
+    let local_hash = sha256_of_file(Path::new(dest)).await?;
+
+    if !remote_hash.is_empty() && local_hash == remote_hash {
+        return Ok(ConflictAction::Touch);
+    }
+
+    let local_meta = tokio::fs::metadata(dest).await?;
+    let local_mtime = local_meta.modified()?;
+
+    if let Ok(rm) = chrono::DateTime::parse_from_rfc3339(remote_mtime) {
+        let remote_sys: SystemTime = rm.with_timezone(&Utc).into();
+        if remote_sys > local_mtime {
+            return Ok(ConflictAction::Overwrite);
+        }
+        let conflict_path = format!(
+            "{}.{}.conflict",
+            dest,
+            rm.format("%Y-%m-%dT%H%M%S%.3f")
+        );
+        Ok(ConflictAction::Conflict(conflict_path))
+    } else {
+        Ok(ConflictAction::Skip)
+    }
+}
+
 async fn incremental_sync(dir: &str, since: &str) -> anyhow::Result<()> {
     let since_dt = DateTime::parse_from_rfc3339(since)?;
     let since_sys: SystemTime = since_dt.with_timezone(&Utc).into();
@@ -516,7 +601,11 @@ async fn walk_and_upload_changed(
                 let rel_path = path.strip_prefix(base).ok().and_then(|p| {
                     p.parent().and_then(|parent| {
                         let s = parent.to_string_lossy();
-                        if s.is_empty() { None } else { Some(s.to_string()) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
                     })
                 });
                 let path_str = path.to_string_lossy().to_string();
