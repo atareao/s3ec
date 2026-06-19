@@ -11,6 +11,43 @@ use tokio::time::{Duration, sleep};
 use crate::client;
 use crate::config;
 
+fn should_retry_upload(err: &anyhow::Error, retry_count: usize, max_retries: usize) -> bool {
+    let err_msg = err.to_string();
+    if err_msg.contains("File is empty") {
+        return false;
+    }
+    if err_msg.contains("Upload failed") {
+        return retry_count < max_retries;
+    }
+    false
+}
+
+async fn handle_upload(path_str: &str, rel_path: Option<&str>) {
+    const MAX_RETRIES: usize = 10;
+    let mut retry = 0;
+    loop {
+        match client::upload(path_str, rel_path).await {
+            Ok(()) => return,
+            Err(e) => {
+                if !should_retry_upload(&e, retry, MAX_RETRIES) {
+                    if !e.to_string().contains("File is empty") {
+                        tracing::warn!("Upload failed for {}: {}", path_str, e);
+                    }
+                    return;
+                }
+                let backoff = Duration::from_millis(1000);
+                tracing::info!(
+                    "Upload failed, retrying {} in {:?}...",
+                    path_str,
+                    backoff
+                );
+                retry += 1;
+                sleep(backoff).await;
+            }
+        }
+    }
+}
+
 pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     let dir = watch_dir.to_string();
     let root = Path::new(&dir).canonicalize()?;
@@ -164,36 +201,7 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path, downloading: Ar
                         let s = p.to_string_lossy().to_string();
                         if s.is_empty() { None } else { Some(s) }
                     });
-                let max_retries = 10;
-                let mut retry = 0;
-                loop {
-                    match client::upload(&path_str, rel_path.as_deref()).await {
-                        Ok(()) => break,
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            if err_msg.contains("File is empty") {
-                                break;
-                            }
-                            let server_error = err_msg.contains("Upload failed");
-                            if retry >= max_retries {
-                                tracing::warn!("Upload failed for {}: {}", path_str, e);
-                                break;
-                            }
-                            if !server_error {
-                                tracing::warn!("Upload failed for {}: {}", path_str, e);
-                                break;
-                            }
-                            let backoff = Duration::from_millis(1000);
-                            tracing::info!(
-                                "Upload failed, retrying {} in {:?}...",
-                                path_str,
-                                backoff
-                            );
-                            retry += 1;
-                            sleep(backoff).await;
-                        }
-                    }
-                }
+                handle_upload(&path_str, rel_path.as_deref()).await;
             }
             if is_delete && let Some(name) = event.name.and_then(|n| n.to_str()) {
                 if name.starts_with('.') {
@@ -750,5 +758,59 @@ mod tests {
             hex::encode(hasher.finalize())
         };
         assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn should_not_retry_empty_file() {
+        let err = anyhow::anyhow!("File is empty");
+        assert!(!should_retry_upload(&err, 0, 10));
+    }
+
+    #[test]
+    fn should_retry_server_error() {
+        let err = anyhow::anyhow!("Upload failed: 500");
+        assert!(should_retry_upload(&err, 0, 10));
+    }
+
+    #[test]
+    fn should_retry_server_error_up_to_max() {
+        let err = anyhow::anyhow!("Upload failed: 503");
+        assert!(should_retry_upload(&err, 0, 10));
+        assert!(should_retry_upload(&err, 5, 10));
+        assert!(should_retry_upload(&err, 9, 10));
+    }
+
+    #[test]
+    fn should_not_retry_server_error_beyond_max() {
+        let err = anyhow::anyhow!("Upload failed: 502");
+        assert!(!should_retry_upload(&err, 10, 10));
+        assert!(!should_retry_upload(&err, 15, 10));
+    }
+
+    #[test]
+    fn should_not_retry_other_errors() {
+        let err = anyhow::anyhow!("Network timeout");
+        assert!(!should_retry_upload(&err, 0, 10));
+    }
+
+    #[test]
+    fn should_not_retry_empty_file_even_if_max_not_reached() {
+        let err = anyhow::anyhow!("File is empty: some_file.txt");
+        assert!(!should_retry_upload(&err, 0, 10));
+        assert!(!should_retry_upload(&err, 0, 1));
+    }
+
+    #[test]
+    fn should_not_retry_empty_file_after_previous_retries() {
+        let err = anyhow::anyhow!("File is empty");
+        assert!(!should_retry_upload(&err, 5, 10));
+    }
+
+    #[test]
+    fn should_respect_custom_max_retries() {
+        let err = anyhow::anyhow!("Upload failed: 500");
+        assert!(should_retry_upload(&err, 2, 3));
+        assert!(!should_retry_upload(&err, 3, 3));
+        assert!(!should_retry_upload(&err, 5, 3));
     }
 }
