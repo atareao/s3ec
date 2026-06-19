@@ -171,21 +171,19 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path, downloading: Ar
                         Ok(()) => break,
                         Err(e) => {
                             let err_msg = e.to_string();
-                            let empty_file = err_msg.contains("File is empty");
+                            if err_msg.contains("File is empty") {
+                                break;
+                            }
                             let server_error = err_msg.contains("Upload failed");
                             if retry >= max_retries {
                                 tracing::warn!("Upload failed for {}: {}", path_str, e);
                                 break;
                             }
-                            if !empty_file && !server_error {
+                            if !server_error {
                                 tracing::warn!("Upload failed for {}: {}", path_str, e);
                                 break;
                             }
-                            let backoff = Duration::from_millis(if empty_file {
-                                debounce_ms * (1 << retry)
-                            } else {
-                                1000
-                            });
+                            let backoff = Duration::from_millis(1000);
                             tracing::info!(
                                 "Upload failed, retrying {} in {:?}...",
                                 path_str,
