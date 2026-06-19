@@ -426,32 +426,8 @@ pub async fn sync_dir(dir: &str) -> anyhow::Result<()> {
         let _ = handle.await;
     }
 
-    let mut handles = Vec::new();
-    for (key, f) in &remote_map {
-        if local_keys.contains(key) {
-            continue;
-        }
-        let dest = format!("{}/{}", dir, key);
-        if let Some(id) = f["id"].as_str() {
-            let id = id.to_string();
-            if !Path::new(&dest).exists() {
-                if let Some(parent) = Path::new(&dest).parent() {
-                    fs::create_dir_all(parent).await?;
-                }
-                let sem = semaphore.clone();
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    tracing::info!("Downloading remote file: {}", dest);
-                    if let Err(e) = client::download(&id, Some(&dest)).await {
-                        tracing::warn!("Failed to download {}: {}", dest, e);
-                    }
-                }));
-            }
-        }
-    }
-    for handle in handles {
-        let _ = handle.await;
-    }
+    tracing::info!("Downloading remote files not present locally");
+    download_missing_remotes(dir, semaphore).await?;
 
     tracing::info!("🚀 Sincronización completa");
 
@@ -593,6 +569,47 @@ async fn resolve_conflict(id: &str, dest: &str) -> anyhow::Result<ConflictAction
     }
 }
 
+async fn download_missing_remotes(dir: &str, semaphore: Arc<Semaphore>) -> anyhow::Result<()> {
+    let remote_files = client::fetch_remote_files().await?;
+
+    let mut handles = Vec::new();
+    for f in &remote_files {
+        let name = f["name"].as_str().unwrap_or("");
+        let path = f["path"].as_str().unwrap_or("");
+        let key = if path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", path, name)
+        };
+        let dest = format!("{}/{}", dir, key);
+
+        if Path::new(&dest).exists() {
+            continue;
+        }
+
+        if let Some(id) = f["id"].as_str() {
+            let id = id.to_string();
+            let sem = semaphore.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                if let Some(parent) = Path::new(&dest).parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                tracing::info!("Downloading remote file: {}", dest);
+                if let Err(e) = client::download(&id, Some(&dest)).await {
+                    tracing::warn!("Failed to download {}: {}", dest, e);
+                }
+            }));
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    Ok(())
+}
+
 async fn incremental_sync(dir: &str, since: &str, downloading: &Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     let since_dt = DateTime::parse_from_rfc3339(since)?;
     let since_sys: SystemTime = since_dt.with_timezone(&Utc).into();
@@ -602,6 +619,11 @@ async fn incremental_sync(dir: &str, since: &str, downloading: &Arc<Mutex<HashSe
 
     tracing::info!("Applying remote changes since {}", since);
     sync_history(dir, since, downloading.clone()).await?;
+
+    tracing::info!("Checking for remote files not present locally");
+    let cfg = crate::config::load()?;
+    let semaphore = Arc::new(Semaphore::new(cfg.concurrency));
+    download_missing_remotes(dir, semaphore).await?;
 
     tracing::info!("Incremental sync complete");
     Ok(())
