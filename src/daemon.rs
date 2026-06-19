@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use inotify::{EventMask, Inotify, WatchMask};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::fs;
 use tokio::sync::Semaphore;
@@ -17,13 +17,15 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
 
     let sync_start = Utc::now().to_rfc3339();
 
+    let downloading: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
     tracing::info!("Starting daemon, watching: {}", dir);
     tracing::info!("Debounce: {}ms", debounce_ms);
 
     match config::load().ok().and_then(|c| c.last_sync_at) {
         Some(since) => {
             tracing::info!("Incremental sync since: {}", since);
-            if let Err(e) = incremental_sync(watch_dir, &since).await {
+            if let Err(e) = incremental_sync(watch_dir, &since, &downloading).await {
                 tracing::warn!("Incremental sync failed: {}", e);
             }
         }
@@ -43,20 +45,22 @@ pub async fn run(watch_dir: &str, debounce_ms: u64) -> anyhow::Result<()> {
     let wdir = dir.clone();
     let wdeb = debounce_ms;
     let wroot = root.clone();
+    let wdownloading = downloading.clone();
     let watcher = tokio::spawn(async move {
-        if let Err(e) = watcher_loop(&wdir, wdeb, &wroot).await {
+        if let Err(e) = watcher_loop(&wdir, wdeb, &wroot, wdownloading).await {
             tracing::error!("Watcher error: {}", e);
         }
     });
 
     let sdir = dir.clone();
     let sse_since = sync_start;
+    let sdownloading = downloading.clone();
     let sse = tokio::spawn(async move {
-        if let Err(e) = sync_history(&sdir, &sse_since).await {
+        if let Err(e) = sync_history(&sdir, &sse_since, sdownloading.clone()).await {
             tracing::warn!("History sync failed: {}", e);
         }
         loop {
-            if let Err(e) = sse_loop(&sdir).await {
+            if let Err(e) = sse_loop(&sdir, sdownloading.clone()).await {
                 tracing::warn!("SSE error: {}, reconnecting in 5s", e);
                 sleep(Duration::from_secs(5)).await;
             }
@@ -102,7 +106,7 @@ fn add_watches_recursive(
     Ok(())
 }
 
-async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Result<()> {
+async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path, downloading: Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     let mut inotify = Inotify::init()?;
     let mut watch_dirs: HashMap<inotify::WatchDescriptor, std::path::PathBuf> = HashMap::new();
 
@@ -146,6 +150,11 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                 }
 
                 tracing::info!("Change detected: {}", path_str);
+
+                if downloading.lock().unwrap().contains(&path_str) {
+                    continue;
+                }
+
                 sleep(debounce).await;
                 let rel_path = full_path
                     .strip_prefix(root)
@@ -202,6 +211,12 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
                         if s.is_empty() { None } else { Some(s) }
                     });
                 tracing::info!("Delete detected: {}/{}", ev_dir.display(), name);
+
+                let del_path_str = full_path.to_string_lossy().to_string();
+                if downloading.lock().unwrap().contains(&del_path_str) {
+                    continue;
+                }
+
                 if let Err(e) = client::delete_by_path(name, rel_path.as_deref()).await {
                     tracing::warn!("Failed to notify server about deleted file {}: {}", name, e);
                 }
@@ -210,7 +225,7 @@ async fn watcher_loop(_dir: &str, debounce_ms: u64, root: &Path) -> anyhow::Resu
     }
 }
 
-async fn sync_history(dir: &str, since: &str) -> anyhow::Result<()> {
+async fn sync_history(dir: &str, since: &str, downloading: Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     client::ensure_valid_token().await?;
     let cfg = crate::config::load()?;
     let url = format!("{}/api/events/history?since={}", cfg.server_url, since);
@@ -221,12 +236,12 @@ async fn sync_history(dir: &str, since: &str) -> anyhow::Result<()> {
     }
     let events: Vec<serde_json::Value> = resp.json().await?;
     for ev in &events {
-        handle_event(ev, dir).await;
+        handle_event(ev, dir, &downloading).await;
     }
     Ok(())
 }
 
-async fn sse_loop(dir: &str) -> anyhow::Result<()> {
+async fn sse_loop(dir: &str, downloading: Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
     client::ensure_valid_token().await?;
@@ -256,7 +271,7 @@ async fn sse_loop(dir: &str) -> anyhow::Result<()> {
                 if let Some(data) = line.strip_prefix("data:")
                     && let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim())
                 {
-                    handle_event(&event, dir).await;
+                    handle_event(&event, dir, &downloading).await;
                 }
             }
         }
@@ -265,7 +280,7 @@ async fn sse_loop(dir: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_event(event: &serde_json::Value, dir: &str) {
+async fn handle_event(event: &serde_json::Value, dir: &str, downloading: &Arc<Mutex<HashSet<String>>>) {
     let event_type = event["type"].as_str().unwrap_or("");
     let payload = &event["payload"];
 
@@ -281,10 +296,12 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
 
             if let Some(id) = event["resource_id"].as_str() {
                 if !Path::new(&dest).exists() {
+                    downloading.lock().unwrap().insert(dest.clone());
                     tracing::info!("Remote {}: downloading {} as {}", event_type, id, dest);
                     if let Err(e) = client::download(id, Some(&dest)).await {
                         tracing::warn!("Download failed: {}", e);
                     }
+                    downloading.lock().unwrap().remove(&dest);
                 } else if event_type == "file_updated" {
                     match resolve_conflict(id, &dest).await {
                         Ok(ConflictAction::Touch) => {
@@ -303,6 +320,7 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                             }
                         }
                         Ok(ConflictAction::Overwrite) => {
+                            downloading.lock().unwrap().insert(dest.clone());
                             tracing::info!(
                                 "Remote {}: remote is newer, overwriting {}",
                                 event_type,
@@ -311,8 +329,10 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                             if let Err(e) = client::download(id, Some(&dest)).await {
                                 tracing::warn!("Download failed: {}", e);
                             }
+                            downloading.lock().unwrap().remove(&dest);
                         }
                         Ok(ConflictAction::Conflict(conflict_path)) => {
+                            downloading.lock().unwrap().insert(conflict_path.clone());
                             tracing::info!(
                                 "Remote {}: local is newer, saving conflict as {}",
                                 event_type,
@@ -321,6 +341,7 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                             if let Err(e) = client::download(id, Some(&conflict_path)).await {
                                 tracing::warn!("Download failed: {}", e);
                             }
+                            downloading.lock().unwrap().remove(&conflict_path);
                         }
                         Ok(ConflictAction::Skip) | Err(_) => {
                             tracing::info!(
@@ -348,8 +369,10 @@ async fn handle_event(event: &serde_json::Value, dir: &str) {
                 format!("{}/{}/{}", dir, path, file_name)
             };
             if Path::new(&dest).exists() {
+                downloading.lock().unwrap().insert(dest.clone());
                 tracing::info!("Remote delete: {}", dest);
                 let _ = tokio::fs::remove_file(&dest).await;
+                downloading.lock().unwrap().remove(&dest);
             }
         }
         _ => {}
@@ -564,7 +587,7 @@ async fn resolve_conflict(id: &str, dest: &str) -> anyhow::Result<ConflictAction
     }
 }
 
-async fn incremental_sync(dir: &str, since: &str) -> anyhow::Result<()> {
+async fn incremental_sync(dir: &str, since: &str, downloading: &Arc<Mutex<HashSet<String>>>) -> anyhow::Result<()> {
     let since_dt = DateTime::parse_from_rfc3339(since)?;
     let since_sys: SystemTime = since_dt.with_timezone(&Utc).into();
 
@@ -572,7 +595,7 @@ async fn incremental_sync(dir: &str, since: &str) -> anyhow::Result<()> {
     walk_and_upload_changed(Path::new(dir), Path::new(dir), &since_sys).await?;
 
     tracing::info!("Applying remote changes since {}", since);
-    sync_history(dir, since).await?;
+    sync_history(dir, since, downloading.clone()).await?;
 
     tracing::info!("Incremental sync complete");
     Ok(())
