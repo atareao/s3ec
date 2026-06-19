@@ -423,3 +423,78 @@ pub async fn rm(id: &str) -> anyhow::Result<()> {
     println!("Deleted file: {}", id);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use crate::config;
+
+    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestConfig {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        backup: Option<String>,
+        cfg_path: PathBuf,
+    }
+
+    impl TestConfig {
+        fn setup() -> Self {
+            let lock = CONFIG_LOCK.lock().unwrap();
+            let cfg_path = dirs::config_dir()
+                .expect("config dir")
+                .join("s3ec")
+                .join("config.toml");
+
+            if let Some(parent) = cfg_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let backup = std::fs::read_to_string(&cfg_path).ok();
+
+            let cfg = config::Config {
+                server_url: "https://test.example.com".into(),
+                api_key: "test-key".into(),
+                token: "test-token".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                concurrency: 5,
+                last_sync_at: None,
+            };
+            config::save(&cfg).expect("failed to save test config");
+            TestConfig { _lock: lock, backup, cfg_path }
+        }
+    }
+
+    impl Drop for TestConfig {
+        fn drop(&mut self) {
+            match &self.backup {
+                Some(content) => {
+                    let _ = std::fs::write(&self.cfg_path, content);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.cfg_path);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_empty_file() {
+        let _cfg = TestConfig::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let result = super::upload(&path.to_string_lossy(), None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("File is empty"), "expected 'File is empty', got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_nonexistent_file() {
+        let _cfg = TestConfig::setup();
+        let result = super::upload("/tmp/s3ec-nonexistent-test-file-xxxxx", None).await;
+        assert!(result.is_err());
+    }
+}
