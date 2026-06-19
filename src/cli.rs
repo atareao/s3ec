@@ -1,5 +1,5 @@
-use clap::{Parser, Subcommand};
 use chrono::Utc;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "s3ec", about = "S3 Event Client")]
@@ -63,9 +63,12 @@ impl Commands {
             Login { server, api_key } => crate::client::login(&server, &api_key).await,
             Upload { file, path } => crate::client::upload(&file, path.as_deref()).await,
             Download { id, output } => crate::client::download(&id, output.as_deref()).await,
-            List { path, search, limit, offset } => {
-                crate::client::list(path.as_deref(), search.as_deref(), limit, offset).await
-            }
+            List {
+                path,
+                search,
+                limit,
+                offset,
+            } => crate::client::list(path.as_deref(), search.as_deref(), limit, offset).await,
             Info { id } => crate::client::info(&id).await,
             Rm { id } => crate::client::rm(&id).await,
             Daemon { watch, debounce_ms } => crate::daemon::run(&watch, debounce_ms).await,
